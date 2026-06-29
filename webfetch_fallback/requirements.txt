@@ -1,0 +1,12 @@
+# Only hard dependency for the HTTP + curl tiers and orchestration.
+requests>=2.31
+
+# The browser tier (strongest against bot-detection 403s and JS-rendered pages)
+# is OPTIONAL and uses Node.js + Playwright instead of a Python package:
+#
+#     npm i playwright            # or: npm i -g playwright
+#     npx playwright install chromium
+#
+# In this remote environment Playwright + Chromium are already installed, so no
+# action is needed here. If neither Node nor Playwright is present, scrape.py
+# still works with the http and curl tiers and degrades gracefully.
