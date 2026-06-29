@@ -133,6 +133,8 @@ async function main() {
     if (req.extraHeaders && Object.keys(req.extraHeaders).length) {
       ctxOpts.extraHTTPHeaders = req.extraHeaders;
     }
+    // Mirror the Python --insecure flag (default: verify TLS).
+    if (req.insecure) ctxOpts.ignoreHTTPSErrors = true;
     const context = await browser.newContext(ctxOpts);
     const page = await context.newPage();
     page0 = page;

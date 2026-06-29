@@ -59,6 +59,7 @@ Exit codes: 0 all ok, 2 some failed, 3 a host was blocked by egress policy,
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -124,7 +125,7 @@ BROWSER_HEADERS = {
 
 HERE = Path(__file__).resolve().parent
 BROWSER_HELPER = HERE / "browser_fetch.cjs"
-PROXY_STATUS_URL = "http://127.0.0.1:45069/__agentproxy/status"
+BROWSER_UNAVAILABLE = "browser helper (browser_fetch.cjs) not found"
 
 
 @dataclass
@@ -140,6 +141,10 @@ class FetchOutcome:
     tier: str = ""
     detail: str = ""
     screenshot_path: str = ""
+    # True when the tier could not run because its tooling is absent (e.g. no
+    # node/playwright/curl), as opposed to a real fetch failure. Lets auto mode
+    # keep a more informative earlier-tier result instead of this one.
+    tooling_missing: bool = False
 
     @property
     def ok(self) -> bool:
@@ -187,20 +192,37 @@ def html_to_text(html: str) -> str:
 
 
 def looks_empty_or_js(html: str) -> bool:
-    """Heuristic: a 200 that is really a JS shell with no readable content."""
+    """Heuristic: a 200 that is really a JS shell with no readable content.
+
+    Only meaningful for HTML. A short JSON/XML/plain-text 200 (e.g. an API
+    response) is legitimate content, NOT an empty shell, so we must not flag it
+    (doing so would trigger a pointless escalation to the browser tier).
+    """
+    low = (html or "").lower()
+    if "<html" not in low and "<!doctype html" not in low:
+        return False  # not HTML -> treat as real content
     text = html_to_text(html or "")
     if len(text) >= 500:
         return False
-    low = (html or "").lower()
     js_markers = ("enable javascript", "__next_data__", "id=\"root\"",
                   "id=\"app\"", "window.__nuxt__", "data-reactroot")
     return any(m in low for m in js_markers) or len(text) < 80
 
 
 def proxy_block_reason(host: str) -> str:
-    """Ask the agent proxy why a host was refused (best effort)."""
+    """Ask the agent proxy why a host was refused (best effort, enrichment only).
+
+    The status endpoint lives on the proxy itself, so derive its address from the
+    active proxy URL rather than hardcoding a port (portable across sessions and
+    a no-op when there is no such endpoint).
+    """
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    if not proxy:
+        return ""
     try:
-        r = requests.get(PROXY_STATUS_URL, timeout=4)
+        netloc = urlparse(proxy).netloc or proxy.split("//")[-1]
+        status_url = f"http://{netloc}/__agentproxy/status"
+        r = requests.get(status_url, timeout=4, proxies={"http": "", "https": ""})
         data = r.json()
         for f in data.get("recentRelayFailures", []) or []:
             if host and host in json.dumps(f):
@@ -211,15 +233,34 @@ def proxy_block_reason(host: str) -> str:
 
 
 def is_proxy_denial(message: str) -> bool:
-    """True if an error message indicates the EGRESS PROXY refused the tunnel."""
+    """True if an error message indicates the EGRESS PROXY refused the tunnel.
+
+    Must recognise the wording of every client we drive, across versions:
+      * urllib3/requests : "Tunnel connection failed: 403 Forbidden"
+      * curl >= 7.x       : "Received HTTP code 403 from proxy after CONNECT"
+      * curl >= 8.x       : "CONNECT tunnel failed, response 403"
+      * Chromium/Playwright: "net::ERR_TUNNEL_CONNECTION_FAILED",
+                             "net::ERR_PROXY_CONNECTION_FAILED"
+    A miss here is dangerous: it makes the ladder ESCALATE past an egress-policy
+    block instead of stopping, i.e. an attempt to route around org policy.
+    """
     m = (message or "").lower()
-    return (
-        "tunnel connection failed" in m
-        or "received http code 403 from proxy" in m
-        or "received http code 407 from proxy" in m
-        or ("407" in m and "proxy" in m)
-        or "proxy authentication required" in m
-    )
+    if any(s in m for s in (
+        "tunnel connection failed",                 # urllib3
+        "received http code 403 from proxy",        # curl 7.x
+        "received http code 407 from proxy",        # curl 7.x
+        "proxy authentication required",            # 407
+        "err_tunnel_connection_failed",             # Chromium
+        "err_proxy_connection_failed",              # Chromium
+    )):
+        return True
+    # curl 8.x: "connect tunnel failed, response 403/407"
+    if "connect tunnel failed" in m and ("403" in m or "407" in m):
+        return True
+    # Generic: a 403/407 mentioned together with a CONNECT/tunnel/proxy context.
+    if ("403" in m or "407" in m) and ("connect" in m or "tunnel" in m or "proxy" in m):
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -283,18 +324,31 @@ def _classify_status(status: int, headers: dict, html: str) -> str:
 # --------------------------------------------------------------------------- #
 # Tier 2: curl (independent TLS stack; sometimes succeeds where requests 403s)
 # --------------------------------------------------------------------------- #
-def fetch_curl(url, timeout, headers, proxy, cabundle) -> FetchOutcome:
+# curl exit codes that mean "the proxy/tunnel could not be established".
+_CURL_PROXY_EXIT_CODES = {56, 97}  # 56 = recv error/CONNECT failed, 97 = proxy handshake
+
+
+def fetch_curl(url, timeout, headers, proxy, cabundle, verify=True) -> FetchOutcome:
+    # Refuse anything that isn't a normal http(s) URL so a crafted value can't be
+    # interpreted by curl as something other than a fetch target.
+    if not re.match(r"^https?://", url, re.I):
+        return FetchOutcome(NETWORK_ERROR, tier="curl", detail="unsupported URL scheme")
     hdr_args = []
     for k, v in headers.items():
         hdr_args += ["-H", f"{k}: {v}"]
     cmd = ["curl", "-sS", "-L", "--compressed",
            "--max-time", str(int(timeout)),
            "-w", "\n__HTTP_STATUS__%{http_code}__FINAL__%{url_effective}__",
-           *hdr_args, url]
+           *hdr_args]
     if proxy:
         cmd += ["--proxy", proxy]
     if cabundle:
         cmd += ["--cacert", cabundle]
+    if not verify:
+        cmd += ["-k"]
+    # "--" then the URL: guarantees a URL beginning with '-' is treated as a
+    # positional argument, never as a curl option (argument-injection guard).
+    cmd += ["--", url]
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
     except subprocess.TimeoutExpired:
@@ -304,8 +358,12 @@ def fetch_curl(url, timeout, headers, proxy, cabundle) -> FetchOutcome:
 
     stderr = p.stderr.decode("utf-8", "replace")
     if p.returncode != 0:
-        if is_proxy_denial(stderr):
-            host = urlparse(url).hostname or ""
+        # Classify an egress-policy block by curl's wording OR its exit code +
+        # CONNECT context. Either signal is enough to HARD STOP (never escalate).
+        host = urlparse(url).hostname or ""
+        connect_ctx = "connect" in stderr.lower() or "tunnel" in stderr.lower()
+        if is_proxy_denial(stderr) or (
+                proxy and p.returncode in _CURL_PROXY_EXIT_CODES and connect_ctx):
             return FetchOutcome(POLICY_BLOCKED, tier="curl",
                                 detail=f"egress proxy refused tunnel to {host}. {stderr.strip()}")
         return FetchOutcome(NETWORK_ERROR, tier="curl", detail=stderr.strip()[:300])
@@ -326,14 +384,16 @@ def fetch_curl(url, timeout, headers, proxy, cabundle) -> FetchOutcome:
 # --------------------------------------------------------------------------- #
 # Tier 3: headless Chromium (executes JS, real browser fingerprint)
 # --------------------------------------------------------------------------- #
-def fetch_browser(url, timeout, headers, ua, proxy, screenshot_path=None) -> FetchOutcome:
+def fetch_browser(url, timeout, headers, ua, proxy, screenshot_path=None,
+                  verify=True) -> FetchOutcome:
     if not BROWSER_HELPER.exists():
-        return FetchOutcome(NETWORK_ERROR, tier="browser",
-                            detail=f"helper not found: {BROWSER_HELPER}")
+        return FetchOutcome(NETWORK_ERROR, tier="browser", detail=BROWSER_UNAVAILABLE,
+                            tooling_missing=True)
     node = _which_node()
     if not node:
         return FetchOutcome(NETWORK_ERROR, tier="browser",
-                            detail="node not found; cannot use the browser tier")
+                            detail="node not found; cannot use the browser tier",
+                            tooling_missing=True)
 
     extra = {k: v for k, v in headers.items()
             if k.lower() not in ("user-agent", "accept-encoding", "connection",
@@ -345,6 +405,7 @@ def fetch_browser(url, timeout, headers, ua, proxy, screenshot_path=None) -> Fet
         "extraHeaders": extra,
         "proxy": proxy or "",
         "waitUntil": "domcontentloaded",
+        "insecure": not verify,
     }
     if screenshot_path:
         req["screenshotPath"] = screenshot_path
@@ -378,25 +439,36 @@ def fetch_browser(url, timeout, headers, ua, proxy, screenshot_path=None) -> Fet
         # ladder treats it like the http/curl tiers do.
         st = int(res.get("status") or 0)
         if st >= 400:
-            cls = _classify_status(st, res.get("headers", {}), res.get("html", "") or "")
+            hdrs = res.get("headers", {}) or {}
+            cls = _classify_status(st, hdrs, res.get("html", "") or "")
+            # Browser response headers are lower-cased by Playwright.
+            ra = hdrs.get("retry-after", "")
             return FetchOutcome(cls, status=st, final_url=res.get("finalUrl", url),
-                                headers=res.get("headers", {}), tier="browser",
-                                detail=f"{etype}: {detail}")
-        # A connection-closed through the proxy usually means the TLS cap was
-        # not applied or the host is unreachable; surface it clearly.
-        cls = NETWORK_ERROR
-        if etype == "proxy_error" and is_proxy_denial(detail):
-            cls = POLICY_BLOCKED
-        return FetchOutcome(cls, tier="browser", detail=f"{etype}: {detail}")
+                                headers=hdrs, tier="browser",
+                                detail=ra if (cls == RATE_LIMITED and ra) else f"{etype}: {detail}")
+        # The Node helper tags a failed CONNECT tunnel as errorType 'proxy_error'
+        # (its regex only matches ERR_PROXY*/ERR_TUNNEL*, which ARE egress-policy
+        # denials). Trust that tag as authoritative - Chromium's net:: wording
+        # does not contain the substrings is_proxy_denial() looks for, so
+        # re-checking it here would let a policy block slip through and escalate.
+        if etype == "proxy_error" or is_proxy_denial(detail):
+            host = urlparse(url).hostname or ""
+            return FetchOutcome(POLICY_BLOCKED, tier="browser",
+                                detail=f"egress proxy refused tunnel to {host}. {etype}: {detail}")
+        # launch/playwright problems are a tooling gap, not a fetch failure.
+        tooling = etype in ("launch_failed", "fatal") or "playwright" in detail.lower()
+        return FetchOutcome(NETWORK_ERROR, tier="browser", detail=f"{etype}: {detail}",
+                            tooling_missing=tooling)
 
     status = int(res.get("status") or 0)
     html = res.get("html", "") or ""
-    cls = _classify_status(status, res.get("headers", {}), html)
+    hdrs = res.get("headers", {}) or {}
+    cls = _classify_status(status, hdrs, html)
     return FetchOutcome(cls, status=status, final_url=res.get("finalUrl", url),
-                        headers=res.get("headers", {}),
-                        body=html.encode("utf-8", "replace"),
+                        headers=hdrs, body=html.encode("utf-8", "replace"),
                         text=html_to_text(html), title=res.get("title", ""),
-                        tier="browser", screenshot_path=res.get("screenshotPath") or "")
+                        tier="browser", screenshot_path=res.get("screenshotPath") or "",
+                        detail=hdrs.get("retry-after", "") if cls == RATE_LIMITED else "")
 
 
 def _which_node():
@@ -422,13 +494,16 @@ class DomainThrottle:
     def wait(self, host: str):
         if self.min_interval <= 0:
             return
+        # Reserve this host's next slot under the lock, then sleep OUTSIDE it so a
+        # slow host never blocks requests to other hosts (the lock is held only
+        # for the bookkeeping, not for the sleep).
         with self._lock:
             now = time.monotonic()
-            last = self._last.get(host, 0.0)
-            sleep_for = self.min_interval - (now - last)
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            self._last[host] = time.monotonic()
+            scheduled = max(now, self._last.get(host, 0.0) + self.min_interval)
+            self._last[host] = scheduled
+        sleep_for = scheduled - now
+        if sleep_for > 0:
+            time.sleep(sleep_for)
 
 
 def robots_allows(url: str, ua: str) -> bool:
@@ -469,18 +544,18 @@ def scrape_one(url, cfg, throttle: DomainThrottle) -> dict:
         if cfg.render:
             ladder = ["browser", "http", "curl"]
 
-    last: FetchOutcome | None = None
+    best: FetchOutcome | None = None
     for tier in ladder:
         throttle.wait(host)
         outcome = _attempt_with_retries(url, tier, session, headers, cfg)
-        last = outcome
+        best = _more_informative(best, outcome)
 
         if outcome.classification == POLICY_BLOCKED:
             # HARD STOP. Egress policy is not something we work around.
             return _record(url, outcome, cfg, policy_blocked=True)
         if outcome.ok:
             return _record(url, outcome, cfg)
-        if outcome.classification in (NOT_FOUND,):
+        if outcome.classification == NOT_FOUND:
             return _record(url, outcome, cfg)
         # Otherwise (site 403, 429 exhausted, 5xx, empty/JS, network): escalate.
         sys.stderr.write(
@@ -489,7 +564,29 @@ def scrape_one(url, cfg, throttle: DomainThrottle) -> dict:
             f"{' - '+outcome.detail if outcome.detail else ''}; escalating...\n"
         )
 
-    return _record(url, last or FetchOutcome(NETWORK_ERROR), cfg)
+    return _record(url, best or FetchOutcome(NETWORK_ERROR), cfg)
+
+
+def _more_informative(a: FetchOutcome | None, b: FetchOutcome) -> FetchOutcome:
+    """Pick the result worth reporting when every tier failed. Prefer one that
+    actually reached the server (has an HTTP status / real classification) over a
+    tooling-unavailable network error, so e.g. a site 403 from the http tier is
+    not masked by 'node not found' from the browser tier."""
+    if a is None:
+        return b
+    if b.tooling_missing and not a.tooling_missing:
+        return a
+    if a.tooling_missing and not b.tooling_missing:
+        return b
+    # Otherwise prefer the one with a concrete HTTP status.
+    return b if (b.status and not a.status) else a
+
+
+# Classifications that are terminal for a tier: retrying the SAME tier cannot
+# change them, so return immediately and let the ladder escalate.
+_TERMINAL = (OK, NOT_FOUND, SITE_FORBIDDEN, EMPTY_OR_JS, POLICY_BLOCKED, BLOCKED_OTHER)
+# Classifications worth retrying within the same tier (transient).
+_RETRYABLE = (RATE_LIMITED, SERVER_ERROR, NETWORK_ERROR)
 
 
 def _attempt_with_retries(url, tier, session, headers, cfg) -> FetchOutcome:
@@ -499,24 +596,19 @@ def _attempt_with_retries(url, tier, session, headers, cfg) -> FetchOutcome:
         if tier == "http":
             outcome = fetch_requests(url, session, cfg.timeout, headers, cfg.verify)
         elif tier == "curl":
-            outcome = fetch_curl(url, cfg.timeout, headers, cfg.proxy, cfg.cabundle)
+            outcome = fetch_curl(url, cfg.timeout, headers, cfg.proxy, cfg.cabundle,
+                                 verify=cfg.verify)
         else:
             ss = None
             if cfg.screenshot:
                 ss = str(cfg.outdir / (_safe_name(url) + ".png"))
             outcome = fetch_browser(url, cfg.timeout, headers, cfg.user_agent,
-                                    cfg.proxy, ss)
+                                    cfg.proxy, ss, verify=cfg.verify)
 
-        # Never retry an egress-policy denial.
-        if outcome.classification == POLICY_BLOCKED:
+        # Terminal for this tier (incl. egress-policy denial and missing tooling):
+        # do not retry the same tier.
+        if outcome.classification in _TERMINAL or outcome.tooling_missing:
             return outcome
-        if outcome.ok or outcome.classification in (NOT_FOUND, SITE_FORBIDDEN, EMPTY_OR_JS):
-            # site_forbidden/empty: no point hammering the same tier; escalate.
-            if outcome.classification in (SITE_FORBIDDEN, EMPTY_OR_JS) and i == 0:
-                return outcome
-            if outcome.ok or outcome.classification == NOT_FOUND:
-                return outcome
-
         if i < attempts - 1:
             delay = _backoff(i, outcome, cfg)
             sys.stderr.write(f"  [{tier}] retry {i+1}/{cfg.max_retries} in {delay:.1f}s\n")
@@ -539,12 +631,14 @@ def _backoff(i, outcome: FetchOutcome, cfg) -> float:
 # Output
 # --------------------------------------------------------------------------- #
 def _safe_name(url: str) -> str:
+    # Append a short stable hash of the FULL url so two URLs that sanitise to the
+    # same readable stem (e.g. very long paths, or differing only in query) never
+    # collide and overwrite each other's output.
     p = urlparse(url)
     name = (p.netloc + p.path).strip("/").replace("/", "_") or p.netloc or "index"
-    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:120]
-    if p.query:
-        name += "_" + re.sub(r"[^A-Za-z0-9]", "", p.query)[:24]
-    return name or "page"
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:100].strip("._") or "page"
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+    return f"{name}.{digest}"
 
 
 def _record(url, outcome: FetchOutcome, cfg, policy_blocked=False) -> dict:
@@ -560,27 +654,29 @@ def _record(url, outcome: FetchOutcome, cfg, policy_blocked=False) -> dict:
         "policy_blocked": policy_blocked,
         "bytes": len(outcome.body),
     }
+    # Build paths by string concatenation (NOT Path.with_suffix, which would treat
+    # the hash/dotted stem as an extension and mangle the filename).
+    stem = str(cfg.outdir / _safe_name(url))
     if outcome.body and (outcome.ok or cfg.save_failures):
-        base = cfg.outdir / _safe_name(url)
         ext = ".html"
         ctype = (outcome.headers or {}).get("Content-Type", "")
         if "json" in ctype:
             ext = ".json"
         elif "xml" in ctype:
             ext = ".xml"
-        content_path = base.with_suffix(ext)
-        content_path.write_bytes(outcome.body)
-        rec["content_path"] = str(content_path)
+        content_path = stem + ext
+        Path(content_path).write_bytes(outcome.body)
+        rec["content_path"] = content_path
         if outcome.text:
-            text_path = base.with_suffix(".txt")
-            text_path.write_text(outcome.text, encoding="utf-8")
-            rec["text_path"] = str(text_path)
+            text_path = stem + ".txt"
+            Path(text_path).write_text(outcome.text, encoding="utf-8")
+            rec["text_path"] = text_path
     if outcome.screenshot_path:
         rec["screenshot_path"] = outcome.screenshot_path
     # Sidecar metadata for every URL.
-    meta_path = cfg.outdir / (_safe_name(url) + ".meta.json")
-    meta_path.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
-    rec["meta_path"] = str(meta_path)
+    meta_path = stem + ".meta.json"
+    Path(meta_path).write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
+    rec["meta_path"] = meta_path
     return rec
 
 
@@ -633,21 +729,34 @@ def build_config(args) -> Config:
         os.environ.pop("HTTPS_PROXY", None)
         os.environ.pop("https_proxy", None)
 
+    # --screenshot only the browser tier can produce one, so force the browser
+    # to run first; otherwise an http/curl success would short-circuit it and no
+    # screenshot would be written.
+    render = args.render or args.screenshot
+
     return Config(
         method=args.method, outdir=outdir, timeout=args.timeout,
         max_retries=args.max_retries, backoff_base=args.backoff_base,
         delay=args.delay, concurrency=args.concurrency,
         user_agent=args.user_agent or DEFAULT_UA, extra_headers=extra_headers,
-        proxy=proxy, cabundle=cabundle, verify=verify, render=args.render,
+        proxy=proxy, cabundle=cabundle, verify=verify, render=render,
         screenshot=args.screenshot, respect_robots=args.respect_robots,
         save_failures=args.save_failures,
     )
 
 
+class BadInvocation(Exception):
+    """Raised for usage errors so main() can exit 4 (distinct from runtime exit 2)."""
+
+
 def collect_urls(args) -> list[str]:
     urls = list(args.urls)
     if args.input:
-        for line in Path(args.input).read_text(encoding="utf-8").splitlines():
+        try:
+            text = Path(args.input).read_text(encoding="utf-8")
+        except OSError as e:
+            raise BadInvocation(f"cannot read --input file {args.input!r}: {e}")
+        for line in text.splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
                 urls.append(line)
@@ -660,8 +769,17 @@ def collect_urls(args) -> list[str]:
     return out
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on error, which collides with our 'some URLs failed'
+    code. Exit 4 instead so bad invocation is distinguishable."""
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write(f"{self.prog}: error: {message}\n")
+        raise SystemExit(4)
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         description="Resilient fallback fetcher for WebFetch 403 / egress-policy-blocked pages.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("USAGE")[0])
@@ -689,7 +807,10 @@ def main(argv=None):
     ap.add_argument("--save-failures", action="store_true", help="also save bodies of failed responses")
     args = ap.parse_args(argv)
 
-    urls = collect_urls(args)
+    try:
+        urls = collect_urls(args)
+    except BadInvocation as e:
+        ap.error(str(e))   # prints usage and exits 4
     if not urls:
         ap.error("no URLs given (pass URLs or --input FILE)")
     cfg = build_config(args)
