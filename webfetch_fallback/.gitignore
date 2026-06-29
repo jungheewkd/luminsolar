@@ -1,0 +1,7 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Default scraper output directory and common ad-hoc ones
+scraped/
+out/
